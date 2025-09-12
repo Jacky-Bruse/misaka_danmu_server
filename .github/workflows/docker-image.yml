@@ -2,12 +2,14 @@
 name: Publish to Docker Hub
 
 # 触发条件：
-# 1. 当推送到 'test' 分支时
-# 2. 当推送到 'beta' 分支时
-# 3. 当创建 'v*.*.*' 格式的标签时
+# 1. 当推送到 'main' 分支时
+# 2. 当推送到 'test' 分支时
+# 3. 当推送到 'beta' 分支时
+# 4. 当创建 'v*.*.*' 格式的标签时
 on:
   push:
     branches:
+      - "main"
       - "test"
       - "beta"
     tags:
@@ -34,6 +36,10 @@ jobs:
             TAG=${GITHUB_REF#refs/tags/}
             # 设置输出: "user/repo:v1.2.3,user/repo:latest"
             echo "tags=${DOCKER_IMAGE}:${TAG},${DOCKER_IMAGE}:latest" >> $GITHUB_OUTPUT
+          # 如果是推送到 main 分支
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            # 设置输出: "user/repo:main"
+            echo "tags=${DOCKER_IMAGE}:main" >> $GITHUB_OUTPUT
           # 如果是推送到 test 分支
           elif [[ $GITHUB_REF == refs/heads/test ]]; then
             # 设置输出: "user/repo:test"
