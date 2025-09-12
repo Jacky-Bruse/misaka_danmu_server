@@ -38,8 +38,8 @@ jobs:
             echo "tags=${DOCKER_IMAGE}:${TAG},${DOCKER_IMAGE}:latest" >> $GITHUB_OUTPUT
           # 如果是推送到 main 分支
           elif [[ $GITHUB_REF == refs/heads/main ]]; then
-            # 设置输出: "user/repo:main"
-            echo "tags=${DOCKER_IMAGE}:main" >> $GITHUB_OUTPUT
+            # 设置输出: "user/repo:latest"
+            echo "tags=${DOCKER_IMAGE}:latest" >> $GITHUB_OUTPUT
           # 如果是推送到 test 分支
           elif [[ $GITHUB_REF == refs/heads/test ]]; then
             # 设置输出: "user/repo:test"
