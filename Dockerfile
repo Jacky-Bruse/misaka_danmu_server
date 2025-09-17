@@ -13,7 +13,30 @@ COPY web/ ./
 # 执行构建
 RUN npm run build
 
-# --- Stage 2: Final Python Application ---
+# --- Stage 2:backend-builder ---
+# 使用官方 Python 镜像专门编译 Nuitka 模块
+FROM l429609201/su-exec:su-exec AS backend-builder
+
+# 安装编译所需的依赖
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential python3-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /backend-build
+
+# 复制 Python 源代码和依赖文件
+COPY src/ ./src/
+COPY requirements.txt .
+
+# 安装 Python 依赖和 Nuitka
+RUN pip install --no-cache-dir -r requirements.txt nuitka
+
+# 使用 --mount=type=secret 安全地挂载密钥，并替换占位符
+RUN --mount=type=secret,id=XOR_KEY_SECRET \
+    sh -c 'XOR_KEY_VALUE=$(cat /run/secrets/XOR_KEY_SECRET) && sed -i "s|__XOR_KEY_PLACEHOLDER__|${XOR_KEY_VALUE}|g" src/rate_limiter.py'
+
+# 编译 rate_limiter.py。移除 --include-package=src 以避免将整个应用打包进去。
+RUN python3 -m nuitka --module src/rate_limiter.py --output-dir=.
+
+# --- Stage 3: Final Python Application ---
 FROM l429609201/su-exec:su-exec
 
 
@@ -32,8 +55,9 @@ WORKDIR /app
 RUN set -ex \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        default-libmysqlclient-dev \
+        build-essential \
         libpq-dev \
+        python3-dev \
         tzdata \
         iputils-ping \
     && addgroup --gid 1000 appgroup \
@@ -53,6 +77,12 @@ COPY exec.sh /exec.sh
 COPY run.sh /run.sh
 RUN chmod +x /exec.sh /run.sh
 
+# 从 backend-builder 阶段复制编译好的 .so 文件
+COPY --from=backend-builder /backend-build/rate_limiter.*.so ./src/rate_limiter.so
+
+# 移除 rate_limiter.py 源码
+RUN rm src/rate_limiter.py
+
 # 从 'builder' 阶段复制构建好的前端静态文件
 COPY --from=builder /app/web/dist ./web/dist/
 
@@ -63,4 +93,5 @@ RUN chown -R appuser:appgroup /app
 EXPOSE 7768
 
 # 运行应用的默认命令
+
 CMD ["/exec.sh"]
