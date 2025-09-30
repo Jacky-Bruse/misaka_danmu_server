@@ -192,12 +192,16 @@ class RateLimiter:
                         self.global_period_seconds = period_map.get(config_data["global_period"], 3600)
                     self.logger.info(f"成功加载并验证了速率限制配置文件。参数: 启用={self.enabled}, 限制={self.global_limit}次/{self.global_period_seconds}秒")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                self.logger.error(f"解密或解析速率限制配置失败: {e}", exc_info=True)
-                raise
+                self.logger.warning(f"解密或解析速率限制配置失败，将使用默认禁用配置: {e}")
+                self.enabled = False
+                self.global_limit = 0
+                return
 
         except Exception as e:
             if not self._verification_failed:
-                self.logger.warning(f"加载速率限制配置时出错，将使用默认值。错误: {e}")
+                self.logger.warning(f"加载速率限制配置时出错，将使用默认禁用配置。错误: {e}")
+                self.enabled = False
+                self.global_limit = 0
 
     async def _get_provider_quota(self, provider_name: str) -> Optional[int]:
         try:
