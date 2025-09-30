@@ -69,6 +69,11 @@ COPY --from=so-extractor /app/src/ ./src/
 
 # 最后复制应用代码（覆盖所有.py文件，确保代码是最新的）
 COPY src/ ./src/
+
+# 显式删除所有可能的.pyc字节码缓存，确保使用最新的.py代码
+RUN find ./src -type f -name "*.pyc" -delete && \
+    find ./src -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
 COPY static/ ./static/
 COPY config/ ./config/
 COPY exec.sh /exec.sh
