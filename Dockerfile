@@ -64,11 +64,10 @@ RUN set -ex \
 # 注意：路径中的 python3.11 需要与基础镜像的Python版本匹配
 COPY --from=python-builder /install /usr/local/lib/python3.11/site-packages
 
-# 从 so-extractor 阶段仅复制.so文件（不复制Python代码）
-COPY --from=so-extractor /app/src/*.so ./src/ 2>/dev/null || true
-COPY --from=so-extractor /app/src/**/*.so ./src/ 2>/dev/null || true
+# 先从 so-extractor 阶段复制.so文件
+COPY --from=so-extractor /app/src/ ./src/
 
-# 复制应用代码（确保Python代码是最新的）
+# 最后复制应用代码（覆盖所有.py文件，确保代码是最新的）
 COPY src/ ./src/
 COPY static/ ./static/
 COPY config/ ./config/
