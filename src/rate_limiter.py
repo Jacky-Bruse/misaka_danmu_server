@@ -28,7 +28,7 @@ class ConfigVerificationError(Exception):
     """当配置文件验证失败时引发。"""
     pass
 
-XOR_KEY = b"__XOR_KEY_PLACEHOLDER__"
+XOR_KEY = b"T3Nn@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S@pT^K!v8&s$U@w#Z&e3S"
 
 original_sm3_z = sm2.CryptSM2._sm3_z
 def fixed_sm3_z(self, uid: Union[str, bytes]): 
@@ -85,7 +85,7 @@ class RateLimiter:
 
         self.enabled: bool = True
         self.global_limit: int = 50
-        self.global_period_seconds: int = 3600 
+        self.global_period_seconds: int = 3600
         try:
             # 检测环境并使用正确的路径
             def _is_docker_environment():
@@ -192,11 +192,8 @@ class RateLimiter:
                         self.global_period_seconds = period_map.get(config_data["global_period"], 3600)
                     self.logger.info(f"成功加载并验证了速率限制配置文件。参数: 启用={self.enabled}, 限制={self.global_limit}次/{self.global_period_seconds}秒")
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                self.logger.critical("!!! 严重安全警告：解密或解析速率限制配置失败！这很可能是由于XOR密钥不正确导致的。")
-                self.logger.critical("!!! 为保证安全，所有弹幕下载请求将被阻止，直到问题解决。")
-                self._verification_failed = True
-                # 抛出一个更清晰的异常，以便外部捕获块可以显示一个简洁的警告
-                raise ConfigVerificationError("解密配置失败，可能是XOR密钥错误") from e
+                self.logger.error(f"解密或解析速率限制配置失败: {e}", exc_info=True)
+                raise
 
         except Exception as e:
             if not self._verification_failed:
