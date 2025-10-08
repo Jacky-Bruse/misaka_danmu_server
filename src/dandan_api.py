@@ -297,6 +297,8 @@ def _process_comments_for_dandanplay(comments_data: List[Dict[str, Any]]) -> Lis
     核心逻辑是移除 p 属性中的字体大小参数，同时保留其他所有部分。
     原始格式: "时间,模式,字体大小,颜色,[来源]"
     目标格式: "时间,模式,颜色,[来源]"
+
+    重要：保留原始的 cid 字段，用于支持增量拉取。
     """
     processed_comments = []
     for i, item in enumerate(comments_data):
@@ -309,12 +311,23 @@ def _process_comments_for_dandanplay(comments_data: List[Dict[str, Any]]) -> Lis
             if '[' in part and ']' in part:
                 core_parts_count = j
                 break
-        
+
         if core_parts_count == 4:
             del p_parts[2] # 移除字体大小 (index 2)
-        
+
         new_p_attr = ','.join(p_parts)
-        processed_comments.append(models.Comment(cid=i, p=new_p_attr, m=item.get("m", "")))
+
+        # 关键修复：保留原始 cid 而不是重置为索引 i
+        # 如果原始数据没有 cid，则使用索引作为后备方案
+        original_cid = item.get("cid")
+        try:
+            # 尝试将 cid 转换为整数（某些爬虫可能返回字符串）
+            cid = int(original_cid) if original_cid is not None else i
+        except (ValueError, TypeError):
+            # 如果转换失败，使用索引作为后备
+            cid = i
+
+        processed_comments.append(models.Comment(cid=cid, p=new_p_attr, m=item.get("m", "")))
     return processed_comments
 
 
@@ -1831,7 +1844,8 @@ async def get_comments_for_dandan(
     episodeId: int = Path(..., description="分集ID (来自 /search/episodes 响应中的 episodeId)"),
     chConvert: int = Query(0, description="中文简繁转换。0-不转换，1-转换为简体，2-转换为繁体。"),
     # 'from' 是 Python 的关键字，所以我们必须使用别名
-    fromTime: int = Query(0, alias="from", description="弹幕开始时间(秒)"),
+    # 注意：from 参数表示上一次请求返回的最后一条弹幕的 cid，用于增量拉取
+    fromCid: int = Query(0, alias="from", description="增量拉取的起始弹幕ID (上一次请求返回的最后一条弹幕的cid)"),
     withRelated: bool = Query(True, description="是否包含关联弹幕"),
     token: str = Depends(get_token_from_path),
     session: AsyncSession = Depends(get_db_session),
@@ -1843,6 +1857,10 @@ async def get_comments_for_dandan(
     """
     模拟 dandanplay 的弹幕获取接口。
     优化：优先使用弹幕库，如果没有则直接从源站获取并异步存储。
+
+    增量拉取机制：
+    - 客户端首次请求时 from=0，返回所有弹幕
+    - 后续请求时 from=上次返回的最后一条弹幕的cid，只返回 cid > from 的弹幕
     """
     # 导入必要的模块
     from . import crud
@@ -2161,22 +2179,23 @@ async def get_comments_for_dandan(
             logger.warning(f"无法获取 episodeId={episodeId} 的弹幕数据")
             return models.CommentResponse(count=0, comments=[])
 
-    # 应用时间过滤：只返回时间大于等于 fromTime 的弹幕
-    if fromTime > 0:
+    # 应用增量拉取过滤：只返回 cid > fromCid 的弹幕
+    if fromCid > 0:
         original_count = len(comments_data)
         filtered_comments = []
         for c in comments_data:
             try:
-                # 防御性类型转换：确保 't' 字段是数字类型
-                time_value = float(c.get('t') or 0)
-                if time_value >= fromTime:
+                # 防御性类型转换：确保 'cid' 字段是数字类型
+                # 注意：某些爬虫可能返回字符串类型的 cid
+                cid_value = int(c.get('cid') or 0)
+                if cid_value > fromCid:
                     filtered_comments.append(c)
             except (ValueError, TypeError) as e:
                 # 如果类型转换失败，记录警告并跳过该弹幕
-                logger.warning(f"弹幕时间字段类型异常，已跳过: t={c.get('t')}, 错误: {e}")
+                logger.warning(f"弹幕 cid 字段类型异常，已跳过: cid={c.get('cid')}, 错误: {e}")
                 continue
         comments_data = filtered_comments
-        logger.debug(f"应用 fromTime={fromTime} 过滤: 原始 {original_count} 条 -> 过滤后 {len(comments_data)} 条")
+        logger.debug(f"应用增量拉取过滤 fromCid={fromCid}: 原始 {original_count} 条 -> 过滤后 {len(comments_data)} 条")
 
     # 应用输出数量限制
     limit_str = await config_manager.get('danmaku_output_limit_per_source', '-1')
