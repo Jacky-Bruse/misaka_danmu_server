@@ -2161,6 +2161,23 @@ async def get_comments_for_dandan(
             logger.warning(f"无法获取 episodeId={episodeId} 的弹幕数据")
             return models.CommentResponse(count=0, comments=[])
 
+    # 应用时间过滤：只返回时间大于等于 fromTime 的弹幕
+    if fromTime > 0:
+        original_count = len(comments_data)
+        filtered_comments = []
+        for c in comments_data:
+            try:
+                # 防御性类型转换：确保 't' 字段是数字类型
+                time_value = float(c.get('t') or 0)
+                if time_value >= fromTime:
+                    filtered_comments.append(c)
+            except (ValueError, TypeError) as e:
+                # 如果类型转换失败，记录警告并跳过该弹幕
+                logger.warning(f"弹幕时间字段类型异常，已跳过: t={c.get('t')}, 错误: {e}")
+                continue
+        comments_data = filtered_comments
+        logger.debug(f"应用 fromTime={fromTime} 过滤: 原始 {original_count} 条 -> 过滤后 {len(comments_data)} 条")
+
     # 应用输出数量限制
     limit_str = await config_manager.get('danmaku_output_limit_per_source', '-1')
     try:
