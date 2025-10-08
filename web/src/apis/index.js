@@ -123,9 +123,9 @@ export const pauseTask = data => api.post(`/api/ui/tasks/${data.taskId}/pause`)
 export const resumeTask = data =>
   api.post(`/api/ui/tasks/${data.taskId}/resume`)
 /** 删除任务 */
-export const deleteTask = data => api.delete(`/api/ui/tasks/${data.taskId}`)
+export const deleteTask = data => api.delete(`/api/ui/tasks/${data.taskId}`, { params: { force: data.force || false } })
 /** 中止任务 */
-export const stopTask = data => api.post(`/api/ui/tasks/${data.taskId}/abort`)
+export const stopTask = data => api.post(`/api/ui/tasks/${data.taskId}/abort`, { force: data.force || false })
 /** 定时任务列表 */
 export const getScheduledTaskList = data =>
   api.get('/api/ui/scheduled-tasks', data)
@@ -147,7 +147,6 @@ export const getAvailableScheduledJobs = () =>
   api.get('/api/ui/scheduled-tasks/available-jobs')
 
 /** 获取流控状态 */
-export const getRateLimitStatus = () => api.get('/api/ui/rate-limit/status')
 
 /** ---------------------------------------------------token相关开始------------------------------------------------ */
 /** 获取token列表 */

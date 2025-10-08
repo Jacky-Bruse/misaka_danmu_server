@@ -16,9 +16,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import exc
 
 from .. import crud, models, tasks, utils
-from ..rate_limiter import RateLimiter, RateLimitExceededError
+from ..rate_limiter import RateLimiter
 from ..config_manager import ConfigManager
 from ..database import get_db_session
+from .dependencies import (
+    get_config_manager,
+    get_metadata_manager,
+    get_rate_limiter,
+    get_scheduler_manager,
+    get_scraper_manager,
+    get_task_manager,
+    get_title_recognition_manager,
+)
 from ..metadata_manager import MetadataSourceManager
 from ..scheduler import SchedulerManager
 from ..scraper_manager import ScraperManager
@@ -46,35 +55,6 @@ def _is_movie_by_title(title: str) -> bool:
 
 # --- 依赖项 ---
 
-def get_scraper_manager(request: Request) -> ScraperManager:
-    """依赖项：从应用状态获取 Scraper 管理器"""
-    return request.app.state.scraper_manager
-
-def get_metadata_manager(request: Request) -> MetadataSourceManager:
-    """依赖项：从应用状态获取元数据源管理器"""
-    return request.app.state.metadata_manager
-
-def get_task_manager(request: Request) -> TaskManager:
-    """依赖项：从应用状态获取任务管理器"""
-    return request.app.state.task_manager
-
-def get_scheduler_manager(request: Request) -> SchedulerManager:
-    """依赖项：从应用状态获取定时任务调度器"""
-    return request.app.state.scheduler_manager
-
-def get_config_manager(request: Request) -> ConfigManager:
-    """依赖项：从应用状态获取配置管理器"""
-    return request.app.state.config_manager
-
-def get_rate_limiter(request: Request) -> RateLimiter:
-    """依赖项：从应用状态获取速率限制器"""
-    return request.app.state.rate_limiter
-
-def get_title_recognition_manager(request: Request):
-    """依赖项：从应用状态获取标题识别管理器"""
-    return request.app.state.title_recognition_manager
-
-# 新增：定义API Key的安全方案，这将自动在Swagger UI中生成“Authorize”按钮
 api_key_scheme = APIKeyQuery(name="api_key", auto_error=False, description="用于所有外部控制API的访问密钥。")
 
 async def verify_api_key(
@@ -614,7 +594,8 @@ async def direct_import(
         season=item_to_import.season,
         year=item_to_import.year,
         is_single_episode=item_to_import.currentEpisodeIndex is not None,
-        episode_index=item_to_import.currentEpisodeIndex
+        episode_index=item_to_import.currentEpisodeIndex,
+        title_recognition_manager=title_recognition_manager
     )
     if duplicate_reason:
         raise HTTPException(
@@ -743,7 +724,8 @@ async def edited_import(
         season=item_to_import.season,
         year=item_to_import.year,
         is_single_episode=False, # 先检查数据源重复
-        episode_index=None
+        episode_index=None,
+        title_recognition_manager=title_recognition_manager
     )
     # 如果数据源已存在，则需要进一步检查单集
     if duplicate_reason and "数据源已存在" in duplicate_reason:
@@ -1389,6 +1371,7 @@ async def get_task_status(
 @router.delete("/tasks/{taskId}", response_model=ControlActionResponse, summary="删除一个历史任务")
 async def delete_task(
     taskId: str,
+    force: bool = False,
     session: AsyncSession = Depends(get_db_session),
     task_manager: TaskManager = Depends(get_task_manager),
 ):
@@ -1398,6 +1381,7 @@ async def delete_task(
     - **排队中**: 从队列中移除。
     - **运行中/已暂停**: 尝试中止任务，然后删除。
     - **已完成/失败**: 从历史记录中删除。
+    - **force=true**: 强制删除，跳过中止逻辑直接删除历史记录。
     """
     task = await crud.get_task_from_history_by_id(session, taskId)
     if not task:
@@ -1405,6 +1389,15 @@ async def delete_task(
 
     task_status = task['status']
 
+    if force:
+        # 强制删除模式：使用SQL直接删除，绕过可能的锁定问题
+        logger.info(f"强制删除任务 {taskId}，状态: {task_status}")
+        if await crud.force_delete_task_from_history(session, taskId):
+            return {"message": f"强制删除任务 {taskId} 成功。"}
+        else:
+            return {"message": "强制删除失败，任务可能已被处理。"}
+
+    # 正常删除模式
     if task_status == TaskStatus.PENDING:
         if await task_manager.cancel_pending_task(taskId):
             logger.info(f"已从队列中取消待处理任务 {taskId}。")
@@ -1418,11 +1411,35 @@ async def delete_task(
         return {"message": "任务可能已被处理或不存在于历史记录中。"}
 
 @router.post("/tasks/{taskId}/abort", response_model=ControlActionResponse, summary="中止正在运行的任务")
-async def abort_task(taskId: str, task_manager: TaskManager = Depends(get_task_manager)):
-    """尝试中止一个当前正在运行或已暂停的任务。此操作会向任务发送一个取消信号，任务将在下一个检查点安全退出。"""
-    if not await task_manager.abort_current_task(taskId):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="中止任务失败，可能任务已完成或不是当前正在执行的任务。")
-    return {"message": "中止任务的请求已发送。"}
+async def abort_task(
+    taskId: str,
+    force: bool = False,
+    task_manager: TaskManager = Depends(get_task_manager),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """
+    尝试中止一个当前正在运行或已暂停的任务。
+    - force=false: 正常中止，向任务发送取消信号
+    - force=true: 强制中止，直接将任务标记为失败状态
+    """
+    if force:
+        # 强制中止：直接将任务标记为失败
+        from . import crud
+        task = await crud.get_task_from_history_by_id(session, taskId)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="任务不存在")
+
+        # 直接更新任务状态为失败
+        success = await crud.force_fail_task(session, taskId)
+        if success:
+            return {"message": "任务已强制标记为失败状态。"}
+        else:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="强制中止任务失败")
+    else:
+        # 正常中止
+        if not await task_manager.abort_current_task(taskId):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="中止任务失败，可能任务已完成或不是当前正在执行的任务。")
+        return {"message": "中止任务的请求已发送。"}
 
 @router.post("/tasks/{taskId}/pause", response_model=ControlActionResponse, summary="暂停正在运行的任务")
 async def pause_task(taskId: str, task_manager: TaskManager = Depends(get_task_manager)):
@@ -1451,67 +1468,6 @@ async def get_execution_task_id(
     """
     execution_id = await crud.get_execution_task_id_from_scheduler_task(session, taskId)
     return ExecutionTaskResponse(schedulerTaskId=taskId, executionTaskId=execution_id)
-
-@router.get("/rate-limit/status", response_model=models.ControlRateLimitStatusResponse, summary="获取流控状态")
-async def get_rate_limit_status(
-    session: AsyncSession = Depends(get_db_session),
-    scraper_manager: ScraperManager = Depends(get_scraper_manager),
-    rate_limiter: RateLimiter = Depends(get_rate_limiter)
-):
-    """
-    获取所有流控规则的当前状态，包括全局和各源的配额使用情况。
-    """
-    # 在获取状态前，先触发一次全局流控的检查，这会强制重置过期的计数器
-    try:
-        await rate_limiter.check("__control_api_status_check__")
-    except RateLimitExceededError:
-        # 我们只关心检查和重置的副作用，不关心它是否真的超限，所以忽略此错误
-        pass
-    except Exception as e:
-        # 记录其他潜在错误，但不中断状态获取
-        logger.error(f"在获取流控状态时，检查全局流控失败: {e}")
-
-    global_enabled = rate_limiter.enabled
-    global_limit = rate_limiter.global_limit
-    period_seconds = rate_limiter.global_period_seconds
-
-    all_states = await crud.get_all_rate_limit_states(session)
-    states_map = {s.providerName: s for s in all_states}
-
-    global_state = states_map.get("__global__")
-    seconds_until_reset = 0
-    if global_state:
-        time_since_reset = get_now().replace(tzinfo=None) - global_state.lastResetTime
-        seconds_until_reset = max(0, int(period_seconds - time_since_reset.total_seconds()))
-
-    provider_items = []
-    all_scrapers_raw = await crud.get_all_scraper_settings(session)
-    # 修正：在显示流控状态时，排除不产生网络请求的 'custom' 源
-    all_scrapers = [s for s in all_scrapers_raw if s['providerName'] != 'custom']
-    for scraper_setting in all_scrapers:
-        provider_name = scraper_setting['providerName']
-        provider_state = states_map.get(provider_name)
-        quota: Union[int, str] = "∞"
-        try:
-            scraper_instance = scraper_manager.get_scraper(provider_name)
-            provider_quota = getattr(scraper_instance, 'rate_limit_quota', None)
-            if provider_quota is not None and provider_quota > 0:
-                quota = provider_quota
-        except ValueError:
-            pass
-        provider_items.append(models.ControlRateLimitProviderStatus(providerName=provider_name, requestCount=provider_state.requestCount if provider_state else 0, quota=quota))
-
-    # 修正：将秒数转换为可读的字符串以匹配响应模型
-    global_period_str = f"{period_seconds} 秒"
-
-    return models.ControlRateLimitStatusResponse(
-        globalEnabled=global_enabled, 
-        globalRequestCount=global_state.requestCount if global_state else 0, 
-        globalLimit=global_limit, globalPeriod=global_period_str, 
-        secondsUntilReset=seconds_until_reset, providers=provider_items)
-
-
-# --- 定时任务管理 ---
 
 @router.get("/scheduler/tasks", response_model=List[Dict[str, Any]], summary="获取所有定时任务")
 async def list_scheduled_tasks(

@@ -1,6 +1,5 @@
 import { ImportTask } from './components/ImportTask'
 import { ScheduleTask } from './components/ScheduleTask'
-import { RateLimitPanel } from './components/RateLimitPanel'
 import { WebhookTasks } from './components/WebhookTasks'
 import { Tabs } from 'antd'
 import { useNavigate, useSearchParams } from 'react-router-dom'
@@ -30,14 +29,9 @@ export const Task = () => {
           key: 'schedule',
           children: <ScheduleTask />,
         },
-        {
-          label: '流控面板',
-          key: 'ratelimit',
-          children: <RateLimitPanel />,
-        },
       ]}
-      onChange={key => {
-        navigate(`/task?key=${key}`, {
+      onChange={tabKey => {
+        navigate(`/task?key=${tabKey}`, {
           replace: true,
         })
       }}
