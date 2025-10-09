@@ -69,10 +69,12 @@ def _generate_xml_from_comments(
     # 新增字段
     ET.SubElement(root, 'sourceprovider').text = provider_name
     ET.SubElement(root, 'datasize').text = str(len(comments))
-    
+
     for comment in comments:
         p_attr = str(comment.get('p', ''))
-        d = ET.SubElement(root, 'd', p=p_attr)
+        cid = str(comment.get('cid', ''))
+        # 将cid作为单独的属性保存，确保可以正确读取
+        d = ET.SubElement(root, 'd', p=p_attr, cid=cid)
         d.text = comment.get('m', '')
     return ET.tostring(root, encoding='unicode', xml_declaration=True)
 

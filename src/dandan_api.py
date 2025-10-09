@@ -1844,8 +1844,8 @@ async def get_comments_for_dandan(
     episodeId: int = Path(..., description="分集ID (来自 /search/episodes 响应中的 episodeId)"),
     chConvert: int = Query(0, description="中文简繁转换。0-不转换，1-转换为简体，2-转换为繁体。"),
     # 'from' 是 Python 的关键字，所以我们必须使用别名
-    # 注意：from 参数表示上一次请求返回的最后一条弹幕的 cid，用于增量拉取
-    fromCid: int = Query(0, alias="from", description="增量拉取的起始弹幕ID (上一次请求返回的最后一条弹幕的cid)"),
+    # 注意：from 参数表示弹幕时间起点，单位为秒（上一请求的播放进度）
+    fromTime: float = Query(0.0, alias="from", description="弹幕开始时间(秒)"),
     withRelated: bool = Query(True, description="是否包含关联弹幕"),
     token: str = Depends(get_token_from_path),
     session: AsyncSession = Depends(get_db_session),
@@ -1858,9 +1858,9 @@ async def get_comments_for_dandan(
     模拟 dandanplay 的弹幕获取接口。
     优化：优先使用弹幕库，如果没有则直接从源站获取并异步存储。
 
-    增量拉取机制：
+    时间过滤机制：
     - 客户端首次请求时 from=0，返回所有弹幕
-    - 后续请求时 from=上次返回的最后一条弹幕的cid，只返回 cid > from 的弹幕
+    - 后续请求时 from=上一请求的播放秒数，只返回出现时间 >= from 的弹幕
     """
     # 导入必要的模块
     from . import crud
@@ -2179,23 +2179,20 @@ async def get_comments_for_dandan(
             logger.warning(f"无法获取 episodeId={episodeId} 的弹幕数据")
             return models.CommentResponse(count=0, comments=[])
 
-    # 应用增量拉取过滤：只返回 cid > fromCid 的弹幕
-    if fromCid > 0:
+    # 应用时间过滤：只返回时间大于等于 fromTime 的弹幕
+    if fromTime > 0:
         original_count = len(comments_data)
         filtered_comments = []
         for c in comments_data:
             try:
-                # 防御性类型转换：确保 'cid' 字段是数字类型
-                # 注意：某些爬虫可能返回字符串类型的 cid
-                cid_value = int(c.get('cid') or 0)
-                if cid_value > fromCid:
+                time_value = float(c.get('t') or 0)
+                if time_value >= fromTime:
                     filtered_comments.append(c)
             except (ValueError, TypeError) as e:
-                # 如果类型转换失败，记录警告并跳过该弹幕
-                logger.warning(f"弹幕 cid 字段类型异常，已跳过: cid={c.get('cid')}, 错误: {e}")
+                logger.warning(f"弹幕时间字段类型异常，已跳过: t={c.get('t')}, 错误: {e}")
                 continue
         comments_data = filtered_comments
-        logger.debug(f"应用增量拉取过滤 fromCid={fromCid}: 原始 {original_count} 条 -> 过滤后 {len(comments_data)} 条")
+        logger.debug(f"应用 fromTime={fromTime} 过滤: 原始 {original_count} 条 -> 过滤后 {len(comments_data)} 条")
 
     # 应用输出数量限制
     limit_str = await config_manager.get('danmaku_output_limit_per_source', '-1')
