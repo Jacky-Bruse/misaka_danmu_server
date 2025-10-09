@@ -64,7 +64,7 @@ def _generate_xml_from_comments(
     ET.SubElement(root, 'chatserver').text = chat_server
     ET.SubElement(root, 'chatid').text = str(episode_id)
     ET.SubElement(root, 'mission').text = '0'
-    ET.SubElement(root, 'maxlimit').text = '2000'
+    ET.SubElement(root, 'maxlimit').text = str(len(comments))
     ET.SubElement(root, 'source').text = 'k-v' # 保持与官方格式一致
     # 新增字段
     ET.SubElement(root, 'sourceprovider').text = provider_name
