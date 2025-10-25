@@ -27,6 +27,7 @@ from .task_manager import TaskManager
 from .metadata_manager import MetadataSourceManager
 from .scraper_manager import ScraperManager
 from .api.control_api import ControlAutoImportRequest, get_title_recognition_manager
+from .search_utils import unified_search
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +281,10 @@ def _generate_episode_id(anime_id: int, source_order: int, episode_number: int) 
     按照弹幕库标准，animeId补0到6位
     例如：animeId=136 → episodeId=25000136010001
     """
+    # 参数验证
+    if anime_id is None or source_order is None or episode_number is None:
+        raise ValueError(f"生成episodeId时参数不能为None: anime_id={anime_id}, source_order={source_order}, episode_number={episode_number}")
+
     # 按照弹幕库标准：animeId补0到6位
     # 格式化为：25 + 6位animeId + 2位源顺序 + 4位集编号
     episode_id = int(f"25{anime_id:06d}{source_order:02d}{episode_number:04d}")
@@ -552,7 +557,8 @@ async def _handle_fallback_search(
     metadata_manager: MetadataSourceManager,
     config_manager: ConfigManager,
     rate_limiter: RateLimiter,
-    title_recognition_manager
+    title_recognition_manager,
+    task_manager: TaskManager
 ) -> DandanSearchAnimeResponse:
     """
     处理后备搜索逻辑
@@ -675,19 +681,13 @@ async def _handle_fallback_search(
     # 记录该token正在执行的搜索任务
     token_search_tasks[token] = search_key
 
-    # 直接启动异步搜索任务，不通过任务管理器
-    import asyncio
-
-    async def run_fallback_search():
-        """在后台运行后备搜索，不阻塞主流程"""
+    # 通过任务管理器提交后备搜索任务
+    async def fallback_search_coro_factory(session_inner: AsyncSession, progress_callback):
+        """后备搜索任务的协程工厂"""
         try:
-            # 空的进度回调，因为不在任务管理器中
-            async def dummy_progress_callback(progress: int, message: str):
-                pass
-
-            # 直接使用传入的session执行搜索
+            # 执行搜索任务
             await _execute_fallback_search_task(
-                search_term, search_key, token, session, dummy_progress_callback,
+                search_term, search_key, token, session_inner, progress_callback,
                 scraper_manager, metadata_manager, config_manager,
                 rate_limiter, title_recognition_manager
             )
@@ -701,12 +701,18 @@ async def _handle_fallback_search(
             if token in token_search_tasks and token_search_tasks[token] == search_key:
                 del token_search_tasks[token]
 
-    # 启动后台任务
+    # 提交后备搜索任务(立即执行模式)
     try:
-        asyncio.create_task(run_fallback_search())
-        logger.info(f"后备搜索任务已启动: {search_term}")
+        task_title = f"后备搜索: {search_term}"
+        task_id, done_event = await task_manager.submit_task(
+            fallback_search_coro_factory,
+            task_title,
+            run_immediately=True,
+            queue_type="fallback"
+        )
+        logger.info(f"后备搜索任务已提交: {task_id}")
     except Exception as e:
-        logger.error(f"启动后备搜索任务失败: {e}")
+        logger.error(f"提交后备搜索任务失败: {e}", exc_info=True)
         search_info["status"] = "failed"
         return DandanSearchAnimeResponse(animes=[])
 
@@ -746,67 +752,18 @@ async def _execute_fallback_search_task(
         # 更新进度
         await progress_callback(10, "开始搜索...")
 
-        # 1. 使用与WebUI相同的搜索逻辑
-        from . import crud
-        import re
-
-        # 获取用户对象（系统用户）
-        from . import models
-        user = models.User(id=0, username="system")
-
-        # 2. 获取别名和补充搜索结果（与WebUI相同）
-        await progress_callback(20, "获取别名...")
-        try:
-            all_possible_aliases, _ = await metadata_manager.search_supplemental_sources(search_term, user)
-        except Exception as e:
-            logger.warning(f"获取别名失败: {e}")
-            all_possible_aliases = set()
-
-        # 3. 验证别名相似度（与WebUI相同的逻辑）
-        validated_aliases = set()
-        for alias in all_possible_aliases:
-            similarity = fuzz.token_set_ratio(search_term, alias)
-            if similarity >= 75:  # 与WebUI相同的阈值
-                validated_aliases.add(alias)
-
-        filter_aliases = validated_aliases
-        filter_aliases.add(search_term)  # 确保原始搜索词总是在列表中
-        logger.info(f"用于过滤的别名列表: {list(filter_aliases)}")
-
-        # 4. 执行全网搜索（与WebUI相同）
-        await progress_callback(40, "执行全网搜索...")
-        all_results = await scraper_manager.search_all([search_term])
-        logger.info(f"直接搜索完成，找到 {len(all_results)} 个原始结果。")
-
-        # 5. 使用与WebUI相同的过滤逻辑
-        def normalize_for_filtering(title: str) -> str:
-            if not title: return ""
-            title = re.sub(r'[\[【(（].*?[\]】)）]', '', title)
-            return title.lower().replace(" ", "").replace("：", ":").strip()
-
-        normalized_filter_aliases = {normalize_for_filtering(alias) for alias in filter_aliases if alias}
-        filtered_results = []
-        for item in all_results:
-            normalized_item_title = normalize_for_filtering(item.title)
-            if not normalized_item_title: continue
-
-            # 使用与WebUI相同的过滤条件
-            if any(fuzz.partial_ratio(normalized_item_title, alias) > 85 for alias in normalized_filter_aliases):
-                filtered_results.append(item)
-
-        logger.info(f"别名过滤: 从 {len(all_results)} 个原始结果中，保留了 {len(filtered_results)} 个相关结果。")
-
-        # 6. 使用与WebUI相同的排序逻辑
-        await progress_callback(70, "排序搜索结果...")
-        source_settings = await crud.get_all_scraper_settings(session)
-        source_order_map = {s['providerName']: s['displayOrder'] for s in source_settings}
-
-        def sort_key(item):
-            provider_order = source_order_map.get(item.provider, 999)
-            similarity_score = fuzz.token_set_ratio(search_term, item.title)
-            return (provider_order, -similarity_score)
-
-        sorted_results = sorted(filtered_results, key=sort_key)
+        # 使用统一的搜索函数
+        sorted_results = await unified_search(
+            search_term=search_term,
+            session=session,
+            scraper_manager=scraper_manager,
+            metadata_manager=metadata_manager,
+            use_alias_expansion=True,
+            use_alias_filtering=True,
+            use_title_filtering=True,
+            use_source_priority_sorting=True,
+            progress_callback=progress_callback
+        )
 
         # 7. 转换为DandanSearchAnimeItem格式
         await progress_callback(80, "转换搜索结果...")
@@ -1030,12 +987,13 @@ def _parse_filename_for_match(filename: str) -> Optional[Dict[str, Any]]:
     title = re.sub(r'\(\s*(19|20)\d{2}\s*\)', '', title).strip()
     title = re.sub(r'\b(19|20)\d{2}\b', '', title).strip()
     title = re.sub(r'\s+', ' ', title).strip(' -')
-    
+
     if title:
         return {
             "title": title,
-            "season": 1,  # 对电影，默认匹配第1季
-            "episode": 1, # 修正：对电影，默认匹配第1集
+            "season": None,  # 电影不设置季度
+            "episode": None, # 电影不设置集数
+            "is_movie": True # 标记为电影
         }
 
     return None
@@ -1164,7 +1122,8 @@ async def search_anime_for_dandan(
     metadata_manager: MetadataSourceManager = Depends(get_metadata_manager),
     config_manager: ConfigManager = Depends(get_config_manager),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
-    title_recognition_manager = Depends(get_title_recognition_manager)
+    title_recognition_manager = Depends(get_title_recognition_manager),
+    task_manager: TaskManager = Depends(get_task_manager)
 ):
     """
     模拟 dandanplay 的 /api/v2/search/anime 接口。
@@ -1276,7 +1235,8 @@ async def search_anime_for_dandan(
 
         return await _handle_fallback_search(
             search_title_for_fallback, token, session, scraper_manager,
-            metadata_manager, config_manager, rate_limiter, title_recognition_manager
+            metadata_manager, config_manager, rate_limiter, title_recognition_manager,
+            task_manager
         )
 
     # 本地库无结果且未启用后备搜索，返回空结果
@@ -1319,7 +1279,7 @@ async def get_bangumi_details(
         if 900000 <= anime_id_int < 1000000:
             # 从所有搜索缓存中查找
             for search_key, search_info in fallback_search_cache.items():
-                if search_info["status"] == "completed" and "bangumi_mapping" in search_info:
+                if search_info.get("status") == "completed" and "bangumi_mapping" in search_info:
                     if bangumiId in search_info["bangumi_mapping"]:
                         mapping_info = search_info["bangumi_mapping"][bangumiId]
                         provider = mapping_info["provider"]
@@ -1376,6 +1336,15 @@ async def get_bangumi_details(
                                         # 新剧集，获取新的真实animeId
                                         real_anime_id = await _get_next_real_anime_id(session)
                                         logger.info(f"新剧集: '{original_title}' (ID={real_anime_id}) 共 {len(actual_episodes)} 集")
+
+                                    # 清除缓存中所有使用这个real_anime_id的其他映射（避免冲突）
+                                    for sk, si in list(fallback_search_cache.items()):
+                                        if si.get("status") == "completed" and "bangumi_mapping" in si:
+                                            for bid, mi in list(si["bangumi_mapping"].items()):
+                                                # 如果是其他映射使用了相同的real_anime_id，清除它
+                                                if mi.get("real_anime_id") == real_anime_id and bid != bangumiId:
+                                                    del si["bangumi_mapping"][bid]
+                                                    logger.info(f"清除冲突的缓存映射: search_key={sk}, bangumiId={bid}, real_anime_id={real_anime_id}")
 
                                     # 存储真实animeId到虚拟animeId的映射关系
                                     mapping_info["real_anime_id"] = real_anime_id
@@ -1516,7 +1485,7 @@ async def _get_match_for_item(
     # --- 步骤 1: 优先进行库内直接搜索 ---
     logger.info("正在进行库内直接搜索...")
     results = await crud.search_episodes_in_library(
-        session, parsed_info["title"], parsed_info["episode"], parsed_info.get("season")
+        session, parsed_info["title"], parsed_info.get("episode"), parsed_info.get("season")
     )
     logger.info(f"直接搜索为 '{parsed_info['title']}' (季:{parsed_info.get('season')} 集:{parsed_info.get('episode')}) 找到 {len(results)} 条记录")
     
@@ -1583,32 +1552,36 @@ async def _get_match_for_item(
             return response
 
     # --- 步骤 2: 如果直接搜索无果，则回退到 TMDB 映射 ---
-    logger.info("直接搜索未找到精确匹配，回退到 TMDB 映射匹配。")
-    potential_animes = await crud.find_animes_for_matching(session, parsed_info["title"])
-    logger.info(f"为标题 '{parsed_info['title']}' 找到 {len(potential_animes)} 个可能的库内作品进行TMDB匹配。")
+    # 注意：TMDB映射仅适用于TV系列，电影跳过此步骤
+    if not parsed_info.get("is_movie"):
+        logger.info("直接搜索未找到精确匹配，回退到 TMDB 映射匹配。")
+        potential_animes = await crud.find_animes_for_matching(session, parsed_info["title"])
+        logger.info(f"为标题 '{parsed_info['title']}' 找到 {len(potential_animes)} 个可能的库内作品进行TMDB匹配。")
 
-    for anime in potential_animes:
-        if anime.get("tmdbId") and anime.get("tmdbEpisodeGroupId"):
-            logger.info(f"正在为作品 ID {anime['animeId']} (TMDB ID: {anime['tmdbId']}) 尝试 TMDB 映射匹配...")
-            tmdb_results = await crud.find_episode_via_tmdb_mapping(
-                session,
-                tmdb_id=anime["tmdbId"],
-                group_id=anime["tmdbEpisodeGroupId"],
-                custom_season=parsed_info.get("season"),
-                custom_episode=parsed_info["episode"]
-            )
-            if tmdb_results:
-                logger.info(f"TMDB 映射匹配成功，找到 {len(tmdb_results)} 个结果。")
-                res = tmdb_results[0]
-                dandan_type = DANDAN_TYPE_MAPPING.get(res.get('type'), "other")
-                dandan_type_desc = DANDAN_TYPE_DESC_MAPPING.get(res.get('type'), "其他")
-                match = DandanMatchInfo(
-                    episodeId=res['episodeId'], animeId=res['animeId'], animeTitle=res['animeTitle'],
-                    episodeTitle=res['episodeTitle'], type=dandan_type, typeDescription=dandan_type_desc,
+        for anime in potential_animes:
+            if anime.get("tmdbId") and anime.get("tmdbEpisodeGroupId"):
+                logger.info(f"正在为作品 ID {anime['animeId']} (TMDB ID: {anime['tmdbId']}) 尝试 TMDB 映射匹配...")
+                tmdb_results = await crud.find_episode_via_tmdb_mapping(
+                    session,
+                    tmdb_id=anime["tmdbId"],
+                    group_id=anime["tmdbEpisodeGroupId"],
+                    custom_season=parsed_info.get("season"),
+                    custom_episode=parsed_info.get("episode")
                 )
-                response = DandanMatchResponse(isMatched=True, matches=[match])
-                logger.info(f"发送匹配响应 (TMDB 映射匹配): {response.model_dump_json(indent=2)}")
-                return response
+                if tmdb_results:
+                    logger.info(f"TMDB 映射匹配成功，找到 {len(tmdb_results)} 个结果。")
+                    res = tmdb_results[0]
+                    dandan_type = DANDAN_TYPE_MAPPING.get(res.get('type'), "other")
+                    dandan_type_desc = DANDAN_TYPE_DESC_MAPPING.get(res.get('type'), "其他")
+                    match = DandanMatchInfo(
+                        episodeId=res['episodeId'], animeId=res['animeId'], animeTitle=res['animeTitle'],
+                        episodeTitle=res['episodeTitle'], type=dandan_type, typeDescription=dandan_type_desc,
+                    )
+                    response = DandanMatchResponse(isMatched=True, matches=[match])
+                    logger.info(f"发送匹配响应 (TMDB 映射匹配): {response.model_dump_json(indent=2)}")
+                    return response
+    else:
+        logger.info("检测到电影文件，跳过 TMDB 映射匹配。")
 
     # --- 步骤 3: 如果所有方法都失败 ---
     # 新增：后备机制 (Fallback Mechanism)
@@ -1653,69 +1626,387 @@ async def _get_match_for_item(
                 logger.warning(f"黑名单正则表达式 '{blacklist_pattern}' 格式错误: {e}，忽略黑名单检查")
 
         logger.info(f"匹配失败，已启用后备机制，正在为 '{item.fileName}' 创建自动搜索任务。")
-        try:
-            # 构造 auto_search_and_import_task 需要的 payload
-            # 如果文件名能解析出季度/集数，则认为是电视剧，否则认为是电影
-            media_type_for_fallback = "tv_series" if parsed_info.get("season") is not None or parsed_info.get("episode") is not None else "movie"
-            
-            auto_import_payload = ControlAutoImportRequest(
-                searchType="keyword",
-                searchTerm=parsed_info["title"],
-                season=parsed_info.get("season"),
-                episode=parsed_info.get("episode"),
-                mediaType=media_type_for_fallback
-            )
 
-            # 为后备任务创建一个唯一的键，以防止在短时间内重复提交
-            unique_key_parts = ["match-fallback", auto_import_payload.searchTerm]
-            if auto_import_payload.season is not None:
-                unique_key_parts.append(f"s{auto_import_payload.season}")
-            if auto_import_payload.episode is not None:
-                # 关键修复：对于单集匹配，将集数也加入唯一键
-                unique_key_parts.append(f"e{auto_import_payload.episode}")
-            # 关键修复：将媒体类型也加入唯一键，以区分同名的电影和电视剧
-            if auto_import_payload.mediaType:
-                unique_key_parts.append(auto_import_payload.mediaType)
-            unique_key = "-".join(unique_key_parts)
+        # 将匹配后备逻辑包装成协程工厂
+        match_fallback_result = {"response": None}  # 用于存储结果
 
-            task_title = f"匹配后备: {item.fileName}"
-
-            # 创建任务协程
-            task_coro = lambda session, cb: tasks.auto_search_and_import_task(
-                auto_import_payload, cb, session, config_manager, scraper_manager, metadata_manager, task_manager,
-                rate_limiter=rate_limiter,
-                title_recognition_manager=title_recognition_manager,
-                api_key=None # 这是一个内部任务，没有API Key
-            )
-            
-            # 准备任务参数用于恢复
-            task_parameters = {
-                "searchType": auto_import_payload.searchType,
-                "searchTerm": auto_import_payload.searchTerm,
-                "season": auto_import_payload.season,
-                "episode": auto_import_payload.episode,
-                "mediaType": auto_import_payload.mediaType,
-                "fileName": item.fileName
-            }
-
-            # 提交任务，并捕获可能的冲突异常
+        async def match_fallback_coro_factory(session_inner: AsyncSession, progress_callback):
+            """匹配后备任务的协程工厂"""
             try:
-                await task_manager.submit_task(
-                    task_coro,
-                    task_title,
-                    unique_key=unique_key,
-                    task_type="match_fallback",
-                    task_parameters=task_parameters,
-                    queue_type="fallback"  # 使用后备队列
+                # 构造 auto_search_and_import_task 需要的 payload
+                # 根据 is_movie 标记判断媒体类型
+                media_type_for_fallback = "movie" if parsed_info.get("is_movie") else "tv_series"
+
+                # 统一使用后备搜索的虚拟ID逻辑
+                from .utils import parse_search_keyword
+
+                logger.info(f"开始匹配后备流程: {item.fileName}")
+
+                # 解析搜索关键词，提取纯标题
+                search_parsed_info = parse_search_keyword(parsed_info["title"])
+                base_title = search_parsed_info["title"]
+                is_movie = parsed_info.get("is_movie", False)
+                season = parsed_info.get("season") or 1
+                # 电影不设置episode_number,保持为None
+                episode_number = None if is_movie else (parsed_info.get("episode") or 1)
+
+                # 步骤1：使用统一的搜索函数
+                logger.info(f"步骤1：全网搜索 '{base_title}'")
+
+                # 使用统一的搜索函数（使用严格过滤模式）
+                all_results = await unified_search(
+                    search_term=base_title,
+                    session=session_inner,
+                    scraper_manager=scraper_manager,
+                    metadata_manager=None,  # 不使用别名扩展
+                    use_alias_expansion=False,
+                    use_alias_filtering=False,
+                    use_title_filtering=True,  # 启用标题过滤
+                    use_source_priority_sorting=False,  # 仅按相似度排序
+                    strict_filtering=True,  # 使用严格过滤模式
+                    custom_aliases={base_title},  # 使用基础标题作为别名
+                    progress_callback=progress_callback
                 )
-                logger.info(f"已为 '{item.fileName}' 成功提交匹配后备任务。")
-            except HTTPException as e:
-                if e.status_code == 409: # Conflict
-                    logger.info(f"匹配后备任务已存在，跳过提交: {e.detail}")
+
+                if not all_results:
+                    logger.warning(f"匹配后备失败：没有找到任何搜索结果")
+                    response = DandanMatchResponse(isMatched=False, matches=[])
+                    match_fallback_result["response"] = response
+                    return
+
+                logger.info(f"搜索完成，共 {len(all_results)} 个结果")
+
+                # 步骤2：智能排序 (类型匹配优先)
+                logger.info(f"步骤2：智能排序 (类型匹配优先)")
+
+                # 确定目标类型
+                target_type = "movie" if is_movie else "tv_series"
+
+                def calculate_match_score(result):
+                    """计算匹配分数，分数越高越优先"""
+                    score = 0
+
+                    # 1. 类型匹配 (最高优先级，+1000分)
+                    if result.type == target_type:
+                        score += 1000
+                        logger.debug(f"  - {result.provider} - {result.title}: 类型匹配 +1000")
+
+                    # 2. 标题相似度 (0-100分)
+                    similarity = fuzz.token_set_ratio(base_title, result.title)
+                    score += similarity
+                    logger.debug(f"  - {result.provider} - {result.title}: 相似度{similarity} +{similarity}")
+
+                    # 3. 年份匹配 (如果有年份信息，+50分)
+                    # TODO: 从parsed_info中获取年份信息
+
+                    return score
+
+                # 按分数排序 (分数高的在前)
+                sorted_results = sorted(all_results, key=calculate_match_score, reverse=True)
+
+                # 打印排序后的结果列表
+                logger.info(f"排序后的搜索结果列表 (按匹配分数):")
+                for idx, result in enumerate(sorted_results, 1):
+                    score = calculate_match_score(result)
+                    type_match = "✓" if result.type == target_type else "✗"
+                    logger.info(f"  {idx}. [{type_match}] {result.provider} - {result.title} (ID: {result.mediaId}, 类型: {result.type}, 年份: {result.year or 'N/A'}, 分数: {score:.0f})")
+
+                # 步骤3：自动选择最佳源
+                logger.info(f"步骤3：自动选择最佳源")
+
+                # 检查是否启用AI匹配
+                ai_match_enabled = (await config_manager.get("aiMatchEnabled", "false")).lower() == 'true'
+
+                # 如果启用AI匹配，尝试使用AI选择
+                ai_selected_index = None
+                if ai_match_enabled:
+                    try:
+                        from .ai_matcher import AIMatcher
+
+                        # 获取AI配置
+                        ai_config = {
+                            "ai_match_provider": await config_manager.get("aiMatchProvider", "deepseek"),
+                            "ai_match_api_key": await config_manager.get("aiMatchApiKey", ""),
+                            "ai_match_base_url": await config_manager.get("aiMatchBaseUrl", ""),
+                            "ai_match_model": await config_manager.get("aiMatchModel", "deepseek-chat"),
+                            "ai_match_prompt": await config_manager.get("aiMatchPrompt", ""),
+                        }
+
+                        # 检查必要配置
+                        if not ai_config["ai_match_api_key"]:
+                            logger.warning("AI匹配已启用但未配置API密钥，降级到传统匹配")
+                        else:
+                            # 构建查询信息
+                            query_info = {
+                                "title": base_title,
+                                "season": season,
+                                "episode": episode_number,
+                                "year": None,  # 匹配后备场景通常没有年份信息
+                                "type": "movie" if is_movie else "tv_series"
+                            }
+
+                            # 获取精确标记信息
+                            favorited_info = {}
+                            async with scraper_manager._session_factory() as ai_session:
+                                from .orm_models import AnimeSource as AS
+                                from sqlalchemy import select as sql_select
+
+                                for result in sorted_results:
+                                    # 查找是否有相同provider和mediaId的源被标记
+                                    stmt = (
+                                        sql_select(AS.isFavorited)
+                                        .where(
+                                            AS.providerName == result.provider,
+                                            AS.mediaId == result.mediaId
+                                        )
+                                        .limit(1)
+                                    )
+                                    result_row = await ai_session.execute(stmt)
+                                    is_favorited = result_row.scalar_one_or_none()
+                                    if is_favorited:
+                                        key = f"{result.provider}:{result.mediaId}"
+                                        favorited_info[key] = True
+
+                            # 初始化AI匹配器并选择
+                            matcher = AIMatcher(ai_config)
+                            ai_selected_index = await matcher.select_best_match(
+                                query_info, sorted_results, favorited_info
+                            )
+
+                            if ai_selected_index is not None:
+                                logger.info(f"AI匹配成功选择: 索引 {ai_selected_index}")
+                            else:
+                                # 检查是否启用传统匹配兜底
+                                ai_fallback_enabled = (await config_manager.get("aiMatchFallbackEnabled", "true")).lower() == 'true'
+                                if ai_fallback_enabled:
+                                    logger.info("AI匹配未找到合适结果，降级到传统匹配")
+                                else:
+                                    logger.warning("AI匹配未找到合适结果，且传统匹配兜底已禁用，将不使用任何结果")
+
+                    except Exception as e:
+                        # 检查是否启用传统匹配兜底
+                        ai_fallback_enabled = (await config_manager.get("aiMatchFallbackEnabled", "true")).lower() == 'true'
+                        if ai_fallback_enabled:
+                            logger.error(f"AI匹配失败，降级到传统匹配: {e}", exc_info=True)
+                        else:
+                            logger.error(f"AI匹配失败，且传统匹配兜底已禁用: {e}", exc_info=True)
+                        ai_selected_index = None
+
+                # 检查是否启用顺延机制
+                fallback_enabled = (await config_manager.get("externalApiFallbackEnabled", "false")).lower() == 'true'
+
+                best_match = None
+
+                # 如果AI选择成功，使用AI选择的结果
+                if ai_selected_index is not None:
+                    best_match = sorted_results[ai_selected_index]
+                    logger.info(f"  - 使用AI选择的结果: {best_match.provider} - {best_match.title}")
+                elif ai_match_enabled:
+                    # AI匹配已启用但失败，检查是否允许降级到传统匹配
+                    ai_fallback_enabled = (await config_manager.get("aiMatchFallbackEnabled", "true")).lower() == 'true'
+                    if not ai_fallback_enabled:
+                        logger.warning("AI匹配失败且传统匹配兜底已禁用，匹配后备失败")
+                        return DandanMatchResponse(isMatched=False, matches=[])
+                    # 允许降级，继续使用传统匹配
+                    logger.info("AI匹配失败，使用传统匹配兜底")
+                    if not fallback_enabled:
+                        # 顺延机制关闭，使用第一个结果 (已经是分数最高的)
+                        best_match = sorted_results[0]
+                        logger.info(f"  - 顺延机制关闭，选择第一个结果: {best_match.provider} - {best_match.title}")
+                elif not fallback_enabled:
+                    # AI未启用，顺延机制关闭，使用第一个结果 (已经是分数最高的)
+                    best_match = sorted_results[0]
+                    logger.info(f"  - 顺延机制关闭，选择第一个结果: {best_match.provider} - {best_match.title}")
+
+                if best_match is None and fallback_enabled:
+                    # 顺延机制启用：依次验证候选源 (按分数从高到低)
+                    logger.info(f"  - 顺延机制启用，依次验证候选源")
+                    for attempt, candidate in enumerate(sorted_results, 1):
+                        logger.info(f"    {attempt}. 正在验证: {candidate.provider} - {candidate.title} (ID: {candidate.mediaId}, 类型: {candidate.type})")
+                        try:
+                            scraper = scraper_manager.get_scraper(candidate.provider)
+                            if not scraper:
+                                logger.warning(f"    {attempt}. {candidate.provider} - 无法获取scraper，跳过")
+                                continue
+
+                            # 获取分集列表进行验证
+                            episodes = await scraper.get_episodes(candidate.mediaId, db_media_type=candidate.type)
+                            if not episodes:
+                                logger.warning(f"    {attempt}. {candidate.provider} - 没有分集列表，跳过")
+                                continue
+
+                            # 如果用户搜索的是电影，只匹配电影类型的候选源
+                            if is_movie:
+                                if candidate.type != "movie":
+                                    logger.warning(f"    {attempt}. {candidate.provider} - 类型不匹配 (搜索电影，但候选源是{candidate.type})，跳过")
+                                    continue
+                                logger.info(f"    {attempt}. {candidate.provider} - 验证通过 (电影)")
+                            # 如果指定了集数，检查是否有目标集数
+                            elif episode_number is not None:
+                                target_episode = None
+                                for ep in episodes:
+                                    if ep.episodeIndex == episode_number:
+                                        target_episode = ep
+                                        break
+
+                                if not target_episode:
+                                    logger.warning(f"    {attempt}. {candidate.provider} - 没有第 {episode_number} 集，跳过")
+                                    continue
+
+                                logger.info(f"    {attempt}. {candidate.provider} - 验证通过")
+                            else:
+                                logger.info(f"    {attempt}. {candidate.provider} - 验证通过")
+                            best_match = candidate
+                            break
+                        except Exception as e:
+                            logger.warning(f"    {attempt}. {candidate.provider} - 验证失败: {e}")
+                            continue
+
+                if not best_match:
+                    logger.warning(f"匹配后备失败：所有候选源都无法提供有效分集")
+                    response = DandanMatchResponse(isMatched=False, matches=[])
+                    match_fallback_result["response"] = response
+                    return
+
+                # 步骤4：应用入库后处理规则
+                logger.info(f"步骤4：应用入库后处理规则")
+                final_title = best_match.title
+                final_season = season if season is not None else 1  # 默认为第1季
+                if title_recognition_manager:
+                    converted_title, converted_season, was_converted, _ = await title_recognition_manager.apply_storage_postprocessing(
+                        best_match.title, season, best_match.provider
+                    )
+                    if was_converted:
+                        final_title = converted_title
+                        final_season = converted_season if converted_season is not None else 1
+                        logger.info(f"  - 应用入库后处理: '{best_match.title}' S{season or 1:02d} -> '{final_title}' S{final_season:02d}")
+
+                # 步骤5：分配虚拟animeId和真实episodeId
+                logger.info(f"步骤5：分配虚拟animeId和真实episodeId")
+
+                # 分配虚拟animeId
+                virtual_anime_id = await _get_next_virtual_anime_id()
+                logger.info(f"  - 分配虚拟animeId: {virtual_anime_id}")
+
+                # 分配真实anime_id（用于生成episodeId）
+                # 注意：Anime和AnimeSource已经在orm_models中定义，这里直接使用
+                stmt = select(orm_models.Anime.id, orm_models.Anime.title).where(
+                    orm_models.Anime.title == final_title,
+                    orm_models.Anime.season == final_season
+                )
+                result = await session_inner.execute(stmt)
+                existing_db_anime = result.mappings().first()
+
+                if existing_db_anime:
+                    real_anime_id = existing_db_anime['id']
+                    logger.info(f"  - 复用已存在的番剧: '{final_title}' (real_anime_id={real_anime_id})")
                 else:
-                    raise # 重新抛出其他HTTP异常
+                    real_anime_id = await _get_next_real_anime_id(session_inner)
+                    logger.info(f"  - 分配新的real_anime_id: {real_anime_id}")
+
+                # 获取或创建source，以获取正确的source_order
+                # 检查是否已有该源
+                source_stmt = select(orm_models.AnimeSource.id, orm_models.AnimeSource.sourceOrder).where(
+                    orm_models.AnimeSource.animeId == real_anime_id,
+                    orm_models.AnimeSource.providerName == best_match.provider,
+                    orm_models.AnimeSource.mediaId == best_match.mediaId
+                )
+                source_result = await session_inner.execute(source_stmt)
+                existing_source = source_result.mappings().first()
+
+                if existing_source:
+                    source_order = existing_source['sourceOrder']
+                    logger.info(f"  - 复用已存在的源: source_order={source_order}")
+                else:
+                    # 查找当前最大的source_order
+                    max_order_stmt = select(func.max(orm_models.AnimeSource.sourceOrder)).where(orm_models.AnimeSource.animeId == real_anime_id)
+                    max_order_result = await session_inner.execute(max_order_stmt)
+                    current_max_order = max_order_result.scalar_one_or_none()
+                    logger.debug(f"  - 查询到的最大source_order: {current_max_order}")
+                    source_order = (current_max_order or 0) + 1
+                    logger.info(f"  - 分配新的source_order: {source_order}")
+
+                # 生成真实episodeId (电影使用1作为episode_number)
+                final_episode_number = 1 if is_movie else episode_number
+                real_episode_id = _generate_episode_id(real_anime_id, source_order, final_episode_number)
+                logger.info(f"  - 生成真实episodeId: {real_episode_id}")
+
+                # 步骤6：存储映射关系到缓存
+                mapping_key = f"fallback_anime_{virtual_anime_id}"
+                fallback_search_cache[mapping_key] = {
+                    "real_anime_id": real_anime_id,
+                    "provider": best_match.provider,
+                    "mediaId": best_match.mediaId,
+                    "final_title": final_title,
+                    "final_season": final_season,
+                    "media_type": best_match.type,
+                    "imageUrl": best_match.imageUrl,
+                    "year": best_match.year,
+                    "timestamp": time.time()
+                }
+
+                # 存储episodeId映射
+                episode_mapping_key = f"fallback_episode_{real_episode_id}"
+                fallback_search_cache[episode_mapping_key] = {
+                    "virtual_anime_id": virtual_anime_id,
+                    "real_anime_id": real_anime_id,
+                    "provider": best_match.provider,
+                    "mediaId": best_match.mediaId,
+                    "episode_number": final_episode_number,  # 使用final_episode_number (电影为1)
+                    "final_title": final_title,
+                    "final_season": final_season,
+                    "media_type": best_match.type,
+                    "imageUrl": best_match.imageUrl,
+                    "year": best_match.year,
+                    "timestamp": time.time()
+                }
+
+                logger.info(f"匹配后备完成: virtual_anime_id={virtual_anime_id}, real_anime_id={real_anime_id}, episodeId={real_episode_id}")
+
+                # 返回真实的匹配结果
+                match_result = DandanMatchInfo(
+                    episodeId=real_episode_id,
+                    animeId=virtual_anime_id,  # 返回虚拟animeId
+                    animeTitle=final_title,
+                    episodeTitle=f"第{episode_number}集" if not parsed_info.get("is_movie") else final_title,
+                    type="tvseries" if not parsed_info.get("is_movie") else "movie",
+                    typeDescription="匹配成功"
+                )
+                response = DandanMatchResponse(isMatched=True, matches=[match_result])
+                logger.info(f"发送匹配响应 (匹配后备): episodeId={real_episode_id}, animeId={virtual_anime_id}")
+                match_fallback_result["response"] = response
+            except Exception as e:
+                logger.error(f"匹配后备失败: {e}", exc_info=True)
+                response = DandanMatchResponse(isMatched=False, matches=[])
+                match_fallback_result["response"] = response
+
+        # 提交匹配后备任务(立即执行模式)
+        try:
+            task_title = f"匹配后备: {item.fileName}"
+            task_id, done_event = await task_manager.submit_task(
+                match_fallback_coro_factory,
+                task_title,
+                run_immediately=True,
+                queue_type="fallback"
+            )
+            logger.info(f"匹配后备任务已提交: {task_id}")
+
+            # 等待任务完成(最多30秒)
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=30.0)
+                logger.info(f"匹配后备任务完成: {task_id}")
+            except asyncio.TimeoutError:
+                logger.warning(f"匹配后备任务超时: {task_id}")
+                match_fallback_result["response"] = DandanMatchResponse(isMatched=False, matches=[])
+
+            # 返回结果
+            if match_fallback_result["response"]:
+                return match_fallback_result["response"]
+            else:
+                return DandanMatchResponse(isMatched=False, matches=[])
         except Exception as e:
-            logger.error(f"提交匹配后备任务时发生错误: {e}", exc_info=True)
+            logger.error(f"提交匹配后备任务失败: {e}", exc_info=True)
+            return DandanMatchResponse(isMatched=False, matches=[])
 
     response = DandanMatchResponse(isMatched=False, matches=[])
     logger.info(f"发送匹配响应 (所有方法均未匹配): {response.model_dump_json(indent=2)}")
@@ -1877,6 +2168,318 @@ async def get_comments_for_dandan(
     if not comments_data:
         logger.info(f"弹幕库中未找到 episodeId={episodeId} 的弹幕，尝试直接从源站获取")
 
+        # 检查是否是后备搜索/匹配后备的episodeId
+        # 虚拟episodeId格式: 25000166010002 (166=anime_id, 01=source_order, 0002=episode_number)
+        # 缓存key格式: fallback_episode_25000166010000 (最后4位为0000表示整部剧)
+
+        fallback_info = None
+        episode_number = None
+
+        # 尝试解析虚拟episodeId
+        if episodeId >= 25000000000000:
+            # 提取anime_id, source_order, episode_number
+            temp_id = episodeId - 25000000000000
+            anime_id_part = temp_id // 1000000
+            temp_id = temp_id % 1000000
+            source_order_part = temp_id // 10000
+            episode_number = temp_id % 10000
+
+            # 构造整部剧的缓存key
+            virtual_anime_base = 25000000000000 + anime_id_part * 1000000 + source_order_part * 10000
+            fallback_series_key = f"fallback_episode_{virtual_anime_base}"
+
+            # 从数据库缓存中查找整部剧的信息
+            fallback_info = await crud.get_cache(session, fallback_series_key)
+            logger.debug(f"查找缓存: {fallback_series_key}, 找到: {fallback_info is not None}")
+
+        # 如果数据库缓存中没有,再从内存缓存中查找(兼容旧逻辑)
+        if not fallback_info:
+            fallback_episode_cache_key = f"fallback_episode_{episodeId}"
+            if fallback_episode_cache_key in fallback_search_cache:
+                fallback_info = fallback_search_cache[fallback_episode_cache_key]
+                episode_number = fallback_info.get("episode_number")
+
+        if fallback_info:
+            logger.info(f"检测到后备搜索/匹配后备的episodeId: {episodeId}, 集数: {episode_number}")
+
+            # 从缓存中获取信息
+            real_anime_id = fallback_info["real_anime_id"]
+            provider = fallback_info["provider"]
+            mediaId = fallback_info["mediaId"]
+            final_title = fallback_info["final_title"]
+            final_season = fallback_info["final_season"]
+            media_type = fallback_info["media_type"]
+            imageUrl = fallback_info.get("imageUrl")
+            year = fallback_info.get("year")
+
+            # 步骤1：创建或获取anime条目
+            from .orm_models import Anime, AnimeSource, Episode
+            from .timezone import get_now
+
+            stmt = select(Anime).where(Anime.id == real_anime_id)
+            result = await session.execute(stmt)
+            existing_anime = result.scalar_one_or_none()
+
+            if not existing_anime:
+                # 创建anime条目
+                logger.info(f"创建anime条目: id={real_anime_id}, title='{final_title}'")
+                new_anime = Anime(
+                    id=real_anime_id,
+                    title=final_title,
+                    type=media_type,
+                    season=final_season,
+                    imageUrl=imageUrl,
+                    year=year,
+                    createdAt=get_now()
+                )
+                session.add(new_anime)
+                await session.flush()
+            else:
+                logger.info(f"anime条目已存在: id={real_anime_id}, title='{existing_anime.title}'")
+
+            # 步骤2：创建或获取source关联
+            source_id = await crud.link_source_to_anime(session, real_anime_id, provider, mediaId)
+            logger.info(f"source_id={source_id}")
+
+            # 提交anime和source创建，避免与后台任务产生锁冲突
+            await session.commit()
+            logger.info(f"已提交anime和source创建")
+
+            # 步骤3：获取分集信息
+            logger.info(f"开始获取分集信息: provider={provider}, mediaId={mediaId}, episode_number={episode_number}")
+
+            # 获取scraper
+            scraper = scraper_manager.get_scraper(provider)
+            if not scraper:
+                logger.error(f"无法获取scraper: {provider}")
+                await session.rollback()
+                return models.CommentResponse(count=0, comments=[])
+
+            # 获取分集列表
+            try:
+                episodes_list = await scraper.get_episodes(mediaId, db_media_type=media_type)
+                if not episodes_list or len(episodes_list) < episode_number:
+                    logger.error(f"无法获取第{episode_number}集的信息")
+                    await session.rollback()
+                    return models.CommentResponse(count=0, comments=[])
+
+                # 获取目标分集信息
+                target_episode = episodes_list[episode_number - 1]
+                provider_episode_id = target_episode.episodeId
+                episode_title = target_episode.title
+                episode_url = target_episode.url
+
+                logger.info(f"获取到分集信息: title='{episode_title}', provider_episode_id='{provider_episode_id}'")
+
+            except Exception as e:
+                logger.error(f"获取分集信息失败: {e}", exc_info=True)
+                await session.rollback()
+                return models.CommentResponse(count=0, comments=[])
+
+            # 步骤4：下载弹幕 (使用task_manager提交到后备队列)
+            logger.info(f"开始下载弹幕: provider_episode_id={provider_episode_id}")
+
+            # 检查是否已有相同的弹幕下载任务正在进行
+            task_unique_key = f"match_fallback_comments_{episodeId}"
+            existing_task = await crud.find_recent_task_by_unique_key(session, task_unique_key, 1)
+            if existing_task:
+                logger.info(f"弹幕下载任务已存在: {task_unique_key}，等待任务完成...")
+                # 等待最多30秒，检查缓存中是否有结果
+                cache_key = f"comments_{episodeId}"
+                for i in range(30):
+                    await asyncio.sleep(1)
+                    if cache_key in comments_fetch_cache:
+                        logger.info(f"从缓存中获取到弹幕数据，共 {len(comments_fetch_cache[cache_key])} 条")
+                        break
+                # 继续执行后续逻辑，从缓存中获取弹幕
+
+            # 保存当前作用域的变量，避免闭包问题
+            current_scraper = scraper
+            current_provider_episode_id = provider_episode_id
+            current_provider = provider
+            current_real_anime_id = real_anime_id
+            current_mediaId = mediaId
+            current_episode_number = episode_number
+            current_episode_title = episode_title
+            current_episode_url = episode_url
+            current_episodeId = episodeId
+            current_fallback_episode_cache_key = f"fallback_episode_{episodeId}"
+            current_rate_limiter = rate_limiter
+            current_final_title = final_title
+            current_final_season = final_season
+            current_media_type = media_type
+            current_imageUrl = imageUrl
+            current_year = year
+            current_episodes_list = episodes_list  # 保存整部剧的分集列表
+
+            async def download_match_fallback_comments_task(task_session, progress_callback):
+                """匹配后备弹幕下载任务"""
+                try:
+                    await progress_callback(10, "开始下载弹幕...")
+
+                    # 检查流控
+                    await current_rate_limiter.check_fallback("match", current_provider)
+
+                    # 下载弹幕
+                    comments = await current_scraper.get_comments(current_provider_episode_id, progress_callback=progress_callback)
+                    if not comments:
+                        logger.warning(f"下载失败，未获取到弹幕")
+                        return None
+
+                    # 增加流控计数
+                    await current_rate_limiter.increment_fallback("match", current_provider)
+                    logger.info(f"下载成功，共 {len(comments)} 条弹幕")
+
+                    # 立即存储到缓存中，让主接口能快速返回
+                    cache_key = f"comments_{current_episodeId}"
+                    comments_fetch_cache[cache_key] = comments
+                    logger.info(f"弹幕已存入缓存: {cache_key}")
+
+                    await progress_callback(60, "创建数据库条目...")
+
+                    # 在task_session中创建或获取anime条目
+                    from .orm_models import Anime
+                    from .timezone import get_now
+
+                    stmt = select(Anime).where(Anime.id == current_real_anime_id)
+                    result = await task_session.execute(stmt)
+                    existing_anime = result.scalar_one_or_none()
+
+                    if not existing_anime:
+                        # 创建anime条目
+                        logger.info(f"任务中创建anime条目: id={current_real_anime_id}, title='{current_final_title}'")
+                        new_anime = Anime(
+                            id=current_real_anime_id,
+                            title=current_final_title,
+                            type=current_media_type,
+                            season=current_final_season,
+                            imageUrl=current_imageUrl,
+                            year=current_year,
+                            createdAt=get_now()
+                        )
+                        task_session.add(new_anime)
+                        await task_session.flush()
+                    else:
+                        logger.info(f"任务中anime条目已存在: id={current_real_anime_id}, title='{existing_anime.title}'")
+
+                    # 创建或获取source关联 (在task_session中)
+                    source_id = await crud.link_source_to_anime(task_session, current_real_anime_id, current_provider, current_mediaId)
+                    logger.info(f"source_id={source_id}")
+
+                    # 获取source_order用于生成虚拟episodeId
+                    from .orm_models import AnimeSource
+                    stmt_source = select(AnimeSource.sourceOrder).where(AnimeSource.id == source_id)
+                    result_source = await task_session.execute(stmt_source)
+                    source_order = result_source.scalar_one()
+
+                    # 创建当前Episode条目
+                    episode_db_id = await crud.create_episode_if_not_exists(
+                        task_session, current_real_anime_id, source_id, current_episode_number,
+                        current_episode_title, current_episode_url, current_provider_episode_id
+                    )
+                    await task_session.flush()
+                    logger.info(f"Episode条目已创建/存在: id={episode_db_id}")
+
+                    # 为整部剧创建一条缓存记录(不下载弹幕,不创建数据库记录)
+                    # 这样播放器推理下一集时能通过缓存触发弹幕下载
+                    # 缓存条目保留3小时,支持连续播放
+                    try:
+                        # 使用虚拟anime_id作为缓存key的前缀
+                        # 格式: fallback_episode_25000166010000 (最后4位为0000表示整部剧)
+                        virtual_anime_base = 25000000000000 + current_real_anime_id * 1000000 + source_order * 10000
+                        fallback_series_key = f"fallback_episode_{virtual_anime_base}"
+
+                        cache_value = {
+                            "real_anime_id": current_real_anime_id,
+                            "provider": current_provider,
+                            "mediaId": current_mediaId,
+                            "final_title": current_final_title,
+                            "final_season": current_final_season,
+                            "media_type": current_media_type,
+                            "imageUrl": current_imageUrl,
+                            "year": current_year,
+                            "total_episodes": len(current_episodes_list)
+                        }
+
+                        # 存储到数据库缓存,3小时过期
+                        await crud.set_cache(task_session, fallback_series_key, cache_value, 10800)
+                        await task_session.flush()
+                        logger.info(f"为整部剧创建了缓存记录: {fallback_series_key} (共{len(current_episodes_list)}集)")
+                    except Exception as e:
+                        logger.warning(f"创建缓存记录失败: {e}")
+
+                    await progress_callback(80, "保存弹幕...")
+
+                    # 保存弹幕
+                    added_count = await crud.save_danmaku_for_episode(
+                        task_session, current_episodeId, comments, None
+                    )
+                    await task_session.commit()
+                    logger.info(f"保存成功，共 {added_count} 条弹幕")
+
+                    # 清理内存缓存(兼容旧逻辑)
+                    if current_fallback_episode_cache_key in fallback_search_cache:
+                        del fallback_search_cache[current_fallback_episode_cache_key]
+                        logger.debug(f"清理内存缓存: {current_fallback_episode_cache_key}")
+
+                    # 注意:不删除数据库缓存中的整部剧记录,保留3小时以支持连续播放
+                    # 数据库缓存会自动过期
+
+                    await progress_callback(100, "完成")
+                    return comments
+
+                except Exception as e:
+                    logger.error(f"匹配后备弹幕下载任务执行失败: {e}", exc_info=True)
+                    await task_session.rollback()
+                    return None
+
+            # 提交弹幕下载任务到后备队列
+            try:
+                task_id, done_event = await task_manager.submit_task(
+                    download_match_fallback_comments_task,
+                    f"匹配后备弹幕下载: episodeId={episodeId}",
+                    unique_key=task_unique_key,
+                    task_type="download_comments",
+                    queue_type="fallback"  # 使用后备队列
+                )
+                logger.info(f"已提交匹配后备弹幕下载任务: {task_id}")
+
+                # 等待任务完成，但设置较短的超时时间（30秒）
+                try:
+                    await asyncio.wait_for(done_event.wait(), timeout=30.0)
+                    # 任务完成，检查缓存中是否有结果
+                    cache_key = f"comments_{episodeId}"
+                    if cache_key in comments_fetch_cache:
+                        logger.info(f"匹配后备弹幕下载任务快速完成，获得 {len(comments_fetch_cache[cache_key])} 条弹幕")
+                        # 不删除缓存，让后续逻辑继续处理
+                    else:
+                        logger.warning(f"任务完成但缓存中未找到弹幕数据")
+                except asyncio.TimeoutError:
+                    logger.warning(f"匹配后备弹幕下载任务超时，任务将在后台继续执行")
+                    # 超时后返回空结果，让用户稍后再试
+                    return models.CommentResponse(count=0, comments=[])
+
+            except HTTPException as e:
+                # 如果是409错误(任务已在运行中),等待一段时间后从缓存获取
+                if e.status_code == 409:
+                    logger.info(f"任务已在运行中，等待现有任务完成...")
+                    # 等待最多30秒，检查缓存中是否有结果
+                    cache_key = f"comments_{episodeId}"
+                    for i in range(30):
+                        await asyncio.sleep(1)
+                        if cache_key in comments_fetch_cache:
+                            logger.info(f"从缓存中获取到弹幕数据，共 {len(comments_fetch_cache[cache_key])} 条")
+                            break
+                    # 继续执行后续逻辑，从缓存中获取弹幕
+                else:
+                    logger.error(f"提交匹配后备弹幕下载任务失败: {e}", exc_info=True)
+                    await session.rollback()
+                    return models.CommentResponse(count=0, comments=[])
+            except Exception as e:
+                logger.error(f"提交匹配后备弹幕下载任务失败: {e}", exc_info=True)
+                await session.rollback()
+                return models.CommentResponse(count=0, comments=[])
+
         # 检查弹幕获取缓存
         cache_key = f"comments_{episodeId}"
         if cache_key in comments_fetch_cache:
@@ -1989,9 +2592,15 @@ async def get_comments_for_dandan(
                 task_unique_key = f"fallback_comments_{episodeId}"
                 existing_task = await crud.find_recent_task_by_unique_key(session, task_unique_key, 1)
                 if existing_task:
-                    logger.info(f"弹幕下载任务已存在: {task_unique_key}")
-                    # 如果任务正在进行，返回空结果，让用户稍后再试
-                    return models.CommentResponse(count=0, comments=[])
+                    logger.info(f"弹幕下载任务已存在: {task_unique_key}，等待任务完成...")
+                    # 等待最多30秒，检查缓存中是否有结果
+                    cache_key = f"comments_{episodeId}"
+                    for i in range(30):
+                        await asyncio.sleep(1)
+                        if cache_key in comments_fetch_cache:
+                            logger.info(f"从缓存中获取到弹幕数据，共 {len(comments_fetch_cache[cache_key])} 条")
+                            break
+                    # 继续执行后续逻辑，从缓存中获取弹幕
 
                 # 3. 将弹幕下载包装成任务管理器任务
                 # 保存当前作用域的变量，避免闭包问题
@@ -2002,6 +2611,7 @@ async def get_comments_for_dandan(
                 current_config_manager = config_manager
                 current_scraper_manager = scraper_manager
                 current_rate_limiter = rate_limiter
+                current_episodes_list_ref = None  # 用于保存整部剧的分集列表
 
                 async def download_comments_task(task_session, progress_callback):
                     try:
@@ -2010,21 +2620,28 @@ async def get_comments_for_dandan(
                         if scraper:
                             # 首先获取分集列表
                             await progress_callback(30, "获取分集列表...")
-                            # 查找映射信息
+                            # 查找映射信息（根据real_anime_id匹配）
                             mapping_info = None
                             for search_key, search_info in fallback_search_cache.items():
                                 if search_key in user_last_bangumi_choice:
                                     last_bangumi_id = user_last_bangumi_choice[search_key]
                                     if last_bangumi_id in search_info.get("bangumi_mapping", {}):
-                                        mapping_info = search_info["bangumi_mapping"][last_bangumi_id]
-                                        break
+                                        temp_mapping = search_info["bangumi_mapping"][last_bangumi_id]
+                                        # 检查real_anime_id是否匹配
+                                        if temp_mapping.get("real_anime_id") == real_anime_id:
+                                            mapping_info = temp_mapping
+                                            logger.info(f"找到匹配的映射信息: search_key={search_key}, bangumiId={last_bangumi_id}, real_anime_id={real_anime_id}")
+                                            break
 
                             if not mapping_info:
-                                logger.error("无法找到映射信息")
+                                logger.error(f"无法找到real_anime_id={real_anime_id}的映射信息")
                                 return None
 
                             media_type = mapping_info.get("type", "movie")
                             episodes_list = await scraper.get_episodes(current_episode_url, db_media_type=media_type)
+                            # 保存到外层作用域，用于后续批量创建Episode记录
+                            nonlocal current_episodes_list_ref
+                            current_episodes_list_ref = episodes_list
 
                         if episodes_list and len(episodes_list) >= current_episode_number:
                             # 获取对应集数的分集信息（episode_number是从1开始的）
@@ -2052,7 +2669,9 @@ async def get_comments_for_dandan(
 
                                 download_results = await tasks._download_episode_comments_concurrent(
                                     scraper, [virtual_episode], current_rate_limiter,
-                                    dummy_progress_callback
+                                    dummy_progress_callback,
+                                    is_fallback=True,
+                                    fallback_type="search"
                                 )
 
                                 # 提取弹幕数据
@@ -2105,11 +2724,46 @@ async def get_comments_for_dandan(
                                         task_session, anime_id, current_provider, current_episode_url
                                     )
 
+                                    # 获取source_order用于生成虚拟episodeId
+                                    from .orm_models import AnimeSource
+                                    stmt_source = select(AnimeSource.sourceOrder).where(AnimeSource.id == source_id)
+                                    result_source = await task_session.execute(stmt_source)
+                                    source_order = result_source.scalar_one()
+
                                     # 3. 创建分集条目（使用原生标题）
                                     episode_db_id = await crud.create_episode_if_not_exists(
                                         task_session, anime_id, source_id, current_episode_number,
                                         original_episode_title, "", provider_episode_id
                                     )
+
+                                    # 为整部剧创建一条缓存记录(不下载弹幕,不创建数据库记录)
+                                    # 这样播放器推理下一集时能通过缓存触发弹幕下载
+                                    # 缓存条目保留3小时,支持连续播放
+                                    if current_episodes_list_ref:
+                                        try:
+                                            # 使用虚拟anime_id作为缓存key的前缀
+                                            # 格式: fallback_episode_25000166010000 (最后4位为0000表示整部剧)
+                                            virtual_anime_base = 25000000000000 + anime_id * 1000000 + source_order * 10000
+                                            fallback_series_key = f"fallback_episode_{virtual_anime_base}"
+
+                                            cache_value = {
+                                                "real_anime_id": anime_id,
+                                                "provider": current_provider,
+                                                "mediaId": current_episode_url,
+                                                "final_title": base_title,
+                                                "final_season": 1,
+                                                "media_type": media_type,
+                                                "imageUrl": image_url,
+                                                "year": year,
+                                                "total_episodes": len(current_episodes_list_ref)
+                                            }
+
+                                            # 存储到数据库缓存,3小时过期
+                                            await crud.set_cache(task_session, fallback_series_key, cache_value, 10800)
+                                            await task_session.flush()
+                                            logger.info(f"为整部剧创建了缓存记录: {fallback_series_key} (共{len(current_episodes_list_ref)}集)")
+                                        except Exception as e:
+                                            logger.warning(f"创建缓存记录失败: {e}")
 
                                     # 4. 保存弹幕到数据库
                                     added_count = await crud.save_danmaku_for_episode(
@@ -2118,6 +2772,16 @@ async def get_comments_for_dandan(
                                     await task_session.commit()
 
                                     logger.info(f"数据库条目创建完成: anime_id={anime_id}, source_id={source_id}, episode_db_id={episode_db_id}, 保存了 {added_count} 条弹幕")
+
+                                    # 清除缓存中所有使用这个real_anime_id的映射关系
+                                    # 因为数据库中已经有了这个ID的记录，下次分配时不会再使用这个ID
+                                    for search_key, search_info in list(fallback_search_cache.items()):
+                                        if search_info.get("status") == "completed" and "bangumi_mapping" in search_info:
+                                            for bangumi_id, mapping_info in list(search_info["bangumi_mapping"].items()):
+                                                if mapping_info.get("real_anime_id") == real_anime_id:
+                                                    # 从映射中移除这个条目
+                                                    del search_info["bangumi_mapping"][bangumi_id]
+                                                    logger.info(f"清除缓存映射: search_key={search_key}, bangumiId={bangumi_id}, real_anime_id={real_anime_id}")
 
                                 except Exception as db_error:
                                     logger.error(f"创建数据库条目失败: {db_error}", exc_info=True)
@@ -2258,6 +2922,7 @@ async def get_comments_for_dandan(
     processed_comments = _process_comments_for_dandanplay(comments_data)
 
     return models.CommentResponse(count=len(processed_comments), comments=processed_comments)
+
 
 # --- 路由挂载 ---
 # 将实现路由挂载到主路由上，以支持两种URL结构。
