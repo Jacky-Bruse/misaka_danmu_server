@@ -1705,7 +1705,8 @@ async def _get_match_for_item(
                     task_title,
                     unique_key=unique_key,
                     task_type="match_fallback",
-                    task_parameters=task_parameters
+                    task_parameters=task_parameters,
+                    queue_type="fallback"  # 使用后备队列
                 )
                 logger.info(f"已为 '{item.fileName}' 成功提交匹配后备任务。")
             except HTTPException as e:
@@ -2141,7 +2142,8 @@ async def get_comments_for_dandan(
                         download_comments_task,
                         f"后备搜索弹幕下载: episodeId={episodeId}",
                         unique_key=task_unique_key,
-                        task_type="download_comments"
+                        task_type="download_comments",
+                        queue_type="fallback"  # 使用后备队列
                     )
                     logger.info(f"已提交弹幕下载任务: {task_id}")
 

@@ -469,6 +469,20 @@ async def get_source_details(
 class ReassociationRequest(models.BaseModel):
     targetAnimeId: int
 
+@router.post("/library/anime/{sourceAnimeId}/reassociate/check", response_model=models.ReassociationConflictResponse, summary="检测关联冲突")
+async def check_reassociation_conflicts(
+    sourceAnimeId: int,
+    request_data: models.ReassociationRequest = Body(...),
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """检测关联操作是否存在冲突"""
+    if sourceAnimeId == request_data.targetAnimeId:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="源作品和目标作品不能相同。")
+
+    conflicts = await crud.check_reassociation_conflicts(session, sourceAnimeId, request_data.targetAnimeId)
+    return conflicts
+
 @router.post("/library/anime/{sourceAnimeId}/reassociate", status_code=status.HTTP_204_NO_CONTENT, summary="重新关联作品的数据源")
 async def reassociate_anime_sources(
     sourceAnimeId: int,
@@ -484,6 +498,23 @@ async def reassociate_anime_sources(
     if not success:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="源作品或目标作品未找到，或操作失败。")
     logger.info(f"用户 '{current_user.username}' 将作品 ID {sourceAnimeId} 的源关联到了 ID {request_data.targetAnimeId}。")
+    return
+
+@router.post("/library/anime/{sourceAnimeId}/reassociate/resolve", status_code=status.HTTP_204_NO_CONTENT, summary="执行关联并解决冲突")
+async def reassociate_with_conflict_resolution(
+    sourceAnimeId: int,
+    request_data: models.ReassociationResolveRequest = Body(...),
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """根据用户选择执行关联操作,解决冲突"""
+    if sourceAnimeId == request_data.targetAnimeId:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="源作品和目标作品不能相同。")
+
+    success = await crud.reassociate_anime_sources_with_resolution(session, sourceAnimeId, request_data)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="源作品或目标作品未找到，或操作失败。")
+    logger.info(f"用户 '{current_user.username}' 将作品 ID {sourceAnimeId} 的源关联到了 ID {request_data.targetAnimeId}，并解决了冲突。")
     return
 
 @router.delete("/library/source/{sourceId}", status_code=status.HTTP_202_ACCEPTED, summary="提交删除指定数据源的任务")
@@ -633,7 +664,7 @@ async def reorder_source_episodes(
 
     task_title = f"重整集数: {source_info['title']} ({source_info['providerName']})"
     task_coro = lambda session, callback: tasks.reorder_episodes_task(sourceId, session, callback)
-    task_id, _ = await task_manager.submit_task(task_coro, task_title)
+    task_id, _ = await task_manager.submit_task(task_coro, task_title, queue_type="management")
 
     logger.info(f"用户 '{current_user.username}' 提交了重整源 ID: {sourceId} 集数的任务 (Task ID: {task_id})。")
     return {"message": f"重整集数任务 '{task_title}' 已提交。", "taskId": task_id}
@@ -685,10 +716,10 @@ async def offset_episodes(
     task_coro = lambda session, callback: tasks.offset_episodes_task(
         request_data.episodeIds, request_data.offset, session, callback
     )
-    
+
     unique_key = f"modify-episodes-{first_episode.sourceId}"
     try:
-        task_id, _ = await task_manager.submit_task(task_coro, task_title, unique_key=unique_key)
+        task_id, _ = await task_manager.submit_task(task_coro, task_title, unique_key=unique_key, queue_type="management")
     except HTTPException as e:
         # 重新抛出由 task_manager 引发的异常 (例如，任务已在运行)
         raise e
@@ -1435,11 +1466,12 @@ async def get_all_tasks(
     session: AsyncSession = Depends(get_db_session),
     search: Optional[str] = Query(None, description="按标题搜索"),
     status: Optional[str] = Query("all", description="按状态过滤: all, in_progress, completed"),
+    queueType: Optional[str] = Query("all", description="按队列类型过滤: all, download, management, fallback"),
     page: int = Query(1, ge=1, description="页码"),
     pageSize: int = Query(20, ge=1, description="每页数量")
 ):
     """获取后台任务的列表和状态，支持搜索和过滤。"""
-    paginated_result = await crud.get_tasks_from_history(session, search, status, page, pageSize)
+    paginated_result = await crud.get_tasks_from_history(session, search, status, queueType, page, pageSize)
     return models.PaginatedTasksResponse(
         total=paginated_result["total"],
         list=[models.TaskInfo.model_validate(t) for t in paginated_result["list"]]
@@ -2460,7 +2492,7 @@ async def import_from_provider(
         doubanId=request_data.doubanId,
         config_manager=config_manager,
         tmdbId=request_data.tmdbId,
-        imdbId=None, 
+        imdbId=None,
         tvdbId=None, # 手动导入时这些ID为空,
         bangumiId=request_data.bangumiId,
         metadata_manager=metadata_manager,
@@ -2469,7 +2501,10 @@ async def import_from_provider(
         session=session,
         manager=scraper_manager,
         rate_limiter=rate_limiter,
-        title_recognition_manager=title_recognition_manager
+        title_recognition_manager=title_recognition_manager,
+        # 新增: 补充源信息
+        supplementProvider=request_data.supplementProvider,
+        supplementMediaId=request_data.supplementMediaId
     )
     
     # 构造任务标题
