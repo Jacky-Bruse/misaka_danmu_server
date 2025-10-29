@@ -18,3 +18,4 @@ src/security_core.py
 src/rate_limiter.py
 .vscode/settings.json
 generator_config.ini
+.claude/settings.local.json
