@@ -88,3 +88,9 @@ jobs:
           platforms: ${{ steps.prep.outputs.platforms }}
           push: true
           tags: ${{ steps.prep.outputs.tags }}
+          # 多层缓存优化：从Registry拉取缓存层，大幅减少构建时间
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/misaka_danmu_server:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/misaka_danmu_server:buildcache,mode=max
+          # 启用BuildKit内联缓存，进一步优化缓存效率
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
