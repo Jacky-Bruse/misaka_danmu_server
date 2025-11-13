@@ -2797,6 +2797,9 @@ async def get_comments_for_dandan(
                                         # 同步PostgreSQL序列(避免主键冲突)
                                         await sync_postgres_sequence(task_session)
 
+                                        # 同步PostgreSQL序列(避免主键冲突)
+                                        await sync_postgres_sequence(task_session)
+
                                     # 2. 创建源关联
                                     source_id = await crud.link_source_to_anime(
                                         task_session, anime_id, current_provider, current_episode_url
